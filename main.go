@@ -6,6 +6,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"github.com/dgrijalva/jwt-go"
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/bcrypt"
@@ -34,7 +36,9 @@ var (
 	jwtSecret = []byte("your_secret_key")
 	db        *gorm.DB
 	// wg        sync.WaitGroup //尝试引入sync.WaitGroup
-	dbonce sync.Once
+	dbonce     sync.Once
+	loginGroup singleflight.Group // 专门用于登录请求合并
+	userCache  sync.Map           // 用户信息缓存
 )
 
 func main() {
@@ -86,8 +90,14 @@ func initDB() {
 		if err != nil {
 			panic("连接数据库失败")
 		}
-		// 自动迁移表结构：检查user表是否存在，不存在则创建，存在可能调用alter table
+		// 自动迁移表结构：检查user表是否存在，不存在则创建，存在可能调用alter table,比如新增字段
 		db.AutoMigrate(&User{})
+
+		// 获取底层 sql.DB 并配置连接池
+		sqlDB, _ := db.DB()
+		sqlDB.SetMaxIdleConns(10)           // 空闲连接数
+		sqlDB.SetMaxOpenConns(100)          // 最大打开连接数
+		sqlDB.SetConnMaxLifetime(time.Hour) // 连接最大存活时间
 	})
 
 }
@@ -100,7 +110,6 @@ func registerHandler(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "请求有误，请重新检查"})
 		return
 	}
-
 	//检查用户名是否重复
 	var existsuser User
 	result := db.Table("users").Where("username = ?", user.Username).Scan(&existsuser)
@@ -110,7 +119,10 @@ func registerHandler(c *gin.Context) {
 	}
 
 	//密码加密
-	user.encryPassword(user.Password)
+	if err := user.encryPassword(user.Password); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "密码加密失败"})
+		return
+	}
 
 	//创建用户
 	if err := db.Create(&user).Error; err != nil {
@@ -122,11 +134,13 @@ func registerHandler(c *gin.Context) {
 }
 
 // 密码加密
-func (user *User) encryPassword(password string) {
+func (user *User) encryPassword(password string) error {
 	hashPassword, err := bcrypt.GenerateFromPassword([]byte(user.Password), bcrypt.DefaultCost)
-	if err == nil {
-		user.Password = string(hashPassword)
+	if err != nil {
+		return err
 	}
+	user.Password = string(hashPassword)
+	return nil
 }
 
 // 验证密码
@@ -143,7 +157,7 @@ func (user *User) passwordCheck(password string) bool {
 func loginHandler(c *gin.Context) {
 
 	// var loginuser User
-	/*用户登录只需username+password，其他信息不需要同时避免信息泄露
+	/*用户登录只需username+password，其他信息不需要同时避免信息泄露，因此重新定义结构体loginuser，不适用原结构体User
 	 */
 	var loginuser struct {
 
@@ -182,6 +196,7 @@ func loginHandler(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "生成令牌失败"})
 		return
 	}
+
 	c.JSON(http.StatusOK, gin.H{"token": &token})
 
 }
@@ -197,13 +212,40 @@ func userinfoHandler(c *gin.Context) {
 
 	//查询用户信息
 	var user User
-	result := db.Table("users").Where("username = ?", username).Scan(&user)
-	if result.RowsAffected <= 0 {
+
+	/*增加singleflight合并相同用户名的请求 ，防止缓存击穿*/
+	result, err, _ := loginGroup.Do(username.(string), func() (interface{}, error) {
+
+		//先从缓存中读取
+		if cached, ok := userCache.Load(username); ok {
+			return cached, nil
+		}
+
+		//若缓存没有，再从数据库读取
+		if err := db.Table("users").Where("username = ?", username).Scan(&user).Error; err != nil {
+			return nil, err
+		}
+
+		//从数据读取信息存入缓存
+		userCache.Store(username, &user)
+		return &user, nil
+	})
+
+	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "当前用户不存在"})
 		return
 	}
 
 	//返回用户信息，密码除外
+	// user = result.(*User)
+	//存在类型断言问题？
+	userPtr, ok := result.(*User)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "内部服务器错误"})
+		return
+	}
+	user = *userPtr
+
 	c.JSON(http.StatusOK, gin.H{
 		"id":       user.ID,
 		"username": user.Username,
@@ -211,6 +253,14 @@ func userinfoHandler(c *gin.Context) {
 		"gender":   user.Gender,
 		"phone":    user.Phone,
 	})
+
+	// c.JSON(http.StatusOK, gin.H{
+	// 	"id":       user.ID,
+	// 	"username": user.Username,
+	// 	"age":      user.Age,
+	// 	"gender":   user.Gender,
+	// 	"phone":    user.Phone,
+	// })
 
 }
 
@@ -230,7 +280,10 @@ func updateHandler(c *gin.Context) {
 	// }
 
 	//密码加密
-	user.encryPassword(user.Password)
+	if err := user.encryPassword(user.Password); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "密码加密失败"})
+		return
+	}
 
 	//修改用户信息：暂不支持用户名
 	// result := db.Model(&User{}).Where("userid = ?", user.ID).Updates(user)
@@ -239,6 +292,8 @@ func updateHandler(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "更新失败"})
 		return
 	}
+	//清空缓存
+	userCache.Delete(user.Username)
 
 	// 检查是否真的更新了行
 	if result.RowsAffected == 0 {
@@ -284,7 +339,7 @@ func generateToken(username string) (string, error) {
 		Username: username,
 		StandardClaims: jwt.StandardClaims{
 			ExpiresAt: expirationTime.Unix(),
-			// lssuer:    "your-app-name",
+			Issuer:    "your-app-name",
 		},
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
