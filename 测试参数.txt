@@ -1,0 +1,56 @@
+中文提示乱码,在 CMD 中执行以下命令，临时切换编码为 UTF-8,
+chcp 65001
+
+
+
+1.注册用户
+新建个json文件data.json，记录文件路径
+内容
+{
+  "username": "testuser",
+  "password": "testpass",
+  "age": 25,
+  "gender": "男",
+  "phone": "13800138000"
+}
+然后在cmd输入
+curl -X POST http://localhost:8080/register ^
+  -H "Content-Type: application/json" ^
+  -d "@D:\go_testfile\data.json"
+
+2.用户登录
+cmd输入
+curl -X POST http://localhost:8080/login -H "Content-Type: application/json" -d "{\"username\":\"testuser\",\"password\":\"testpass\"}"
+
+输出有token，记录后在用户查询时使用
+
+
+
+
+3.查询用户信息**（使用返回的 token）
+例如
+curl http://localhost:8080/user -H "Authorization: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VybmFtZSI6InRlc3R1c2VyIiwiZXhwIjoxNzUyMzcxODcxfQ.SPE2SYEMz6eTFikVgbMjiciR-brein2dCH9ReZ276Ns"
+
+4.用户信息更新
+新建个json文件update.json，记录文件路径
+内容,里面字段值可修改
+{
+  "username": "testuser",
+  "password": "testpass",
+  "age": 25,
+  "gender": "男",
+  "phone": "13800138000"
+}
+然后在cmd输入
+curl -X POST http://localhost:8080/update ^
+  -H "Content-Type: application/json" ^
+  -d "@D:\go_testfile\update.json"
+
+
+
+
+
+
+
+
+  
